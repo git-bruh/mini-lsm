@@ -48,44 +48,76 @@ impl BlockIterator {
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        unimplemented!()
+        let mut iterator = Self::new(block);
+        iterator.seek_to_first();
+        iterator
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
-        unimplemented!()
+        let mut iterator = Self::new(block);
+        iterator.seek_to_key(key);
+        iterator
     }
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.block.data[self.value_range.0..self.value_range.1]
     }
 
     /// Returns true if the iterator is valid.
     /// Note: You may want to make use of `key`
     pub fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.key.len() > 0
     }
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        unimplemented!()
+        self.idx = 0;
+        self.next()
     }
 
     /// Move to the next key in the block.
     pub fn next(&mut self) {
-        unimplemented!()
+        if self.idx == self.block.offsets.len() {
+            self.key.clear();
+            return;
+        }
+
+        let mut offset = self.block.offsets[self.idx] as usize;
+        self.idx += 1;
+
+        let key_size =
+            u16::from_be_bytes([self.block.data[offset], self.block.data[offset + 1]]) as usize;
+        offset += 2;
+        let key = KeyVec::from_vec(self.block.data[offset..offset + key_size].into());
+        offset += key_size;
+        let value_size =
+            u16::from_be_bytes([self.block.data[offset], self.block.data[offset + 1]]) as usize;
+        offset += 2;
+
+        if self.first_key.len() == 0 {
+            self.first_key = key.clone();
+        }
+        self.key = key;
+        self.value_range = (offset, offset + value_size);
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        unimplemented!()
+        self.idx = 0;
+        loop {
+            self.next();
+            if self.key.as_key_slice() >= key || !self.is_valid() {
+                return;
+            }
+        }
     }
 }
