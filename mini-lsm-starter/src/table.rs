@@ -212,20 +212,33 @@ impl SsTable {
 
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        if let Some(cache) = &self.block_cache {
+            cache
+                .try_get_with((self.id, block_idx), || self.read_block(block_idx))
+                .map_err(|e| anyhow::anyhow!(e))
+        } else {
+            self.read_block(block_idx)
+        }
     }
 
     /// Find the block that may contain `key`.
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        let mut block_idx = 0;
-        for (idx, meta) in self.block_meta.iter().enumerate() {
-            if meta.first_key.as_key_slice() <= key {
-                block_idx = idx;
+        let mut begin = 0;
+        let mut end = self.block_meta.len();
+        loop {
+            let idx = (begin + end) / 2;
+            if self.block_meta[idx].first_key.as_key_slice() > key {
+                end = idx;
+            } else {
+                begin = idx;
+            }
+
+            if (end - begin) == 1 {
+                return begin;
             }
         }
-        block_idx
     }
 
     fn block_size(&self) -> usize {
