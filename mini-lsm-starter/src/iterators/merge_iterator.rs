@@ -109,7 +109,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     fn next(&mut self) -> Result<()> {
         let current = std::mem::replace(&mut self.current, None);
         if current.is_none() {
-            anyhow::bail!("no valid iterator left");
+            return Ok(());
         }
 
         let mut current = current.expect("already checked");

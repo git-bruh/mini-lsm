@@ -235,7 +235,7 @@ impl SsTable {
                 begin = idx;
             }
 
-            if (end - begin) == 1 {
+            if (end - begin) <= 1 {
                 return begin;
             }
         }

@@ -59,6 +59,15 @@ impl SsTableIterator {
         })
     }
 
+    /// Create a new iterator and seek to the first key-value pair which > `key`.
+    pub fn create_and_seek_after_key(table: Arc<SsTable>, key: KeySlice) -> Result<Self> {
+        let mut iter = Self::create_and_seek_to_key(table, key)?;
+        if iter.is_valid() && iter.key() == key {
+            iter.next()?;
+        }
+        Ok(iter)
+    }
+
     /// Seek to the first key-value pair which >= `key`.
     /// Note: You probably want to review the handout for detailed explanation when implementing
     /// this function.
