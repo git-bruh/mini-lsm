@@ -102,6 +102,7 @@ impl FileObject {
 
     /// Create a new file object (day 2) and write the file to the disk (day 4).
     pub fn create(path: &Path, data: Vec<u8>) -> Result<Self> {
+        std::fs::create_dir_all(path.parent().expect("sst path in root"))?;
         std::fs::write(path, &data)?;
         File::open(path)?.sync_all()?;
         Ok(FileObject(

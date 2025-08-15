@@ -40,7 +40,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -398,7 +398,29 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock_observer = self.state_lock.lock();
+
+        let mut state = {
+            let state = self.state.read();
+            LsmStorageState {
+                memtable: state.memtable.clone(),
+                levels: state.levels.clone(),
+                imm_memtables: state.imm_memtables.clone(),
+                l0_sstables: state.l0_sstables.clone(),
+                sstables: state.sstables.clone(),
+            }
+        };
+
+        let imm_memtable = state.imm_memtables.pop().expect("no memtables to flush");
+        let sstable = imm_memtable.flush(
+            SsTableBuilder::new(self.options.block_size),
+            self.path_of_sst(imm_memtable.id()),
+        )?;
+        state.l0_sstables.insert(0, sstable.sst_id());
+        state.sstables.insert(sstable.sst_id(), Arc::new(sstable));
+
+        let _ = std::mem::replace(&mut *self.state.write(), Arc::new(state));
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
