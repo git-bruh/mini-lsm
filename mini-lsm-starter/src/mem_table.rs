@@ -217,4 +217,8 @@ impl StorageIterator for MemTableIterator {
 
         Ok(())
     }
+
+    fn num_active_iterators(&self) -> usize {
+        if self.is_valid() { 1 } else { 0 }
+    }
 }

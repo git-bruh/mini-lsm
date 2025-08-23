@@ -175,7 +175,11 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.flush_notifier.send(())?;
+        if let Some(handle) = self.flush_thread.lock().take() {
+            handle.join().expect("joining handle failed");
+        }
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -449,6 +453,11 @@ impl LsmStorageInner {
             Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes(x)),
             Bound::Unbounded => Bound::Unbounded,
         };
+        let end_key = match map_bound(upper) {
+            Bound::Included(x) => Bound::Included(KeyBytes::from_bytes(x)),
+            Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes(x)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
 
         let mut sstable_iters: Vec<Box<SsTableIterator>> = Vec::new();
         for id in &state.l0_sstables {
@@ -457,6 +466,15 @@ impl LsmStorageInner {
                 .get(id)
                 .expect("id in l0_sstables but not sstables")
                 .clone();
+
+            if !range_overlap(
+                &begin_key,
+                &end_key,
+                sstable.first_key(),
+                sstable.last_key(),
+            ) {
+                continue;
+            }
 
             match &begin_key {
                 Bound::Included(key) => sstable_iters.push(Box::new(
@@ -479,4 +497,21 @@ impl LsmStorageInner {
             map_bound(upper),
         )?))
     }
+}
+
+fn range_overlap(
+    user_begin: &Bound<KeyBytes>,
+    user_end: &Bound<KeyBytes>,
+    first_key: &KeyBytes,
+    last_key: &KeyBytes,
+) -> bool {
+    return match user_begin {
+        Bound::Included(key) => first_key >= key,
+        Bound::Excluded(key) => first_key > key,
+        Bound::Unbounded => false,
+    } || match user_end {
+        Bound::Included(key) => last_key <= key,
+        Bound::Excluded(key) => last_key < key,
+        Bound::Unbounded => true,
+    };
 }

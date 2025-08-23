@@ -206,7 +206,11 @@ impl SsTable {
 
         let block = self.file.read(
             self.block_meta[block_idx].offset as u64,
-            self.block_size() as u64,
+            (self
+                .block_meta
+                .get(block_idx + 1)
+                .map_or(self.block_meta_offset, |meta| meta.offset)
+                - self.block_meta[block_idx].offset) as u64,
         )?;
         Ok(Arc::new(Block::decode(&block)))
     }
@@ -240,15 +244,6 @@ impl SsTable {
                 return begin;
             }
         }
-    }
-
-    fn block_size(&self) -> usize {
-        self.block_meta_offset
-            - self
-                .block_meta
-                .last()
-                .expect("no metadata blocks read")
-                .offset
     }
 
     /// Get number of data blocks.
