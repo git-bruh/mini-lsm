@@ -31,6 +31,8 @@ pub struct BlockIterator {
     value_range: (usize, usize),
     /// Current index of the key-value pair, should be in range of [0, num_of_elements)
     idx: usize,
+    /// Prefix length to be taken from first_key
+    prefix_size: usize,
     /// The first key in the block
     first_key: KeyVec,
 }
@@ -42,6 +44,7 @@ impl BlockIterator {
             key: KeyVec::new(),
             value_range: (0, 0),
             idx: 0,
+            prefix_size: 0,
             first_key: KeyVec::new(),
         }
     }
@@ -92,16 +95,22 @@ impl BlockIterator {
     pub fn next(&mut self) {
         if self.idx == self.block.offsets.len() {
             self.key.clear();
+            self.prefix_size = 0;
             return;
         }
 
         let mut offset = self.block.offsets[self.idx] as usize;
         self.idx += 1;
 
+        let prefix_size =
+            u16::from_be_bytes([self.block.data[offset], self.block.data[offset + 1]]) as usize;
+        offset += 2;
         let key_size =
             u16::from_be_bytes([self.block.data[offset], self.block.data[offset + 1]]) as usize;
         offset += 2;
-        let key = KeyVec::from_vec(self.block.data[offset..offset + key_size].into());
+        let mut prefixed_key = self.first_key.as_key_slice().into_inner()[0..prefix_size].to_vec();
+        prefixed_key.extend(self.block.data[offset..offset + key_size].to_vec());
+        let key = KeyVec::from_vec(prefixed_key);
         offset += key_size;
         let value_size =
             u16::from_be_bytes([self.block.data[offset], self.block.data[offset + 1]]) as usize;

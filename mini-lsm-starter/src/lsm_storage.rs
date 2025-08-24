@@ -327,6 +327,14 @@ impl LsmStorageInner {
                 .get(id)
                 .expect("id in l0_sstables but no sstables")
                 .clone();
+
+            if let Some(bloom) = &sstable.bloom {
+                let h = farmhash::fingerprint32(key);
+                if !bloom.may_contain(h) {
+                    continue;
+                }
+            }
+
             sstable_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
                 sstable,
                 Key::from_slice(key),

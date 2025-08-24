@@ -35,6 +35,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -47,6 +48,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            hashes: Vec::new(),
         }
     }
 
@@ -78,6 +80,7 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+        self.hashes.push(farmhash::fingerprint32(key.into_inner()));
         if !self.builder.add(key, value) {
             self.flush_block();
             if !self.builder.add(key, value) {
@@ -102,7 +105,7 @@ impl SsTableBuilder {
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
         self.flush_block();
-        BlockMeta::encode_block_meta(&self.meta, &mut self.data);
+        BlockMeta::encode_block_meta(&self.meta, &mut self.data, &self.hashes);
         let file = FileObject::create(path.as_ref(), self.data)?;
         SsTable::open(id, block_cache, file)
     }

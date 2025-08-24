@@ -49,7 +49,7 @@ impl BlockMeta {
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
-    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
+    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>, hashes: &[u32]) {
         let original_len = buf.len();
         for meta in block_meta {
             buf.put_u16(meta.offset as _);
@@ -58,8 +58,11 @@ impl BlockMeta {
             buf.put_u16(meta.last_key.len() as _);
             buf.put_slice(meta.last_key.as_key_slice().into_inner());
         }
-        // put the metadata length at the end to avoid repeated reads of the file
         buf.put_u32((buf.len() - original_len) as u32);
+        let bloom_begin = buf.len();
+        Bloom::build_from_key_hashes(hashes, Bloom::bloom_bits_per_key(hashes.len(), 0.01))
+            .encode(buf);
+        buf.put_u32(bloom_begin as u32);
     }
 
     /// Decode block meta from a buffer.
@@ -143,16 +146,27 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        let metadata_len_raw = file.read(file.size() - 4, 4)?;
+        let bloom_filter_offset_raw = file.read(file.size() - 4, 4)?;
+        let bloom_filter_offset = u32::from_be_bytes([
+            bloom_filter_offset_raw[0],
+            bloom_filter_offset_raw[1],
+            bloom_filter_offset_raw[2],
+            bloom_filter_offset_raw[3],
+        ]) as u64;
+
+        let metadata_len_raw = file.read(bloom_filter_offset - 4, 4)?;
         let metadata_len = u32::from_be_bytes([
             metadata_len_raw[0],
             metadata_len_raw[1],
             metadata_len_raw[2],
             metadata_len_raw[3],
         ]) as u64;
-        let block_meta_offset = file.size() - 4 - metadata_len;
+        let block_meta_offset = bloom_filter_offset - 4 - metadata_len;
 
         let metadata = file.read(block_meta_offset, metadata_len)?;
+        let bloom = Some(Bloom::decode(
+            &file.read(bloom_filter_offset, file.size() - 4 - bloom_filter_offset)?,
+        )?);
         let block_meta = BlockMeta::decode_block_meta(Cursor::new(metadata));
         let first_key = block_meta
             .first()
@@ -173,7 +187,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom,
             max_ts: 0,
         })
     }

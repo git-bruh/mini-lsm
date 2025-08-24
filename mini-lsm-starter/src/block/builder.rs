@@ -47,22 +47,39 @@ impl BlockBuilder {
     /// You may find the `bytes::BufMut` trait useful for manipulating binary data.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        if self.first_key.len() == 0 {
-            self.first_key.set_from_slice(key);
-        } else {
-            // + 6 for offset, key and value lengths, and final number of elements
-            if (self.data.len() + (self.offsets.len() * 2) + key.len() + value.len() + 8)
-                > self.block_size
-            {
-                return false;
-            }
+        // + 10 for offset, key, prefix and value lengths, and final number of elements
+        if self.first_key.len() > 0
+            && ((self.data.len() + (self.offsets.len() * 2) + key.len() + value.len() + 10)
+                > self.block_size)
+        {
+            return false;
         }
 
+        let prefix_len = 'blk: {
+            for (idx, (a, b)) in key
+                .into_inner()
+                .iter()
+                .zip(self.first_key.as_key_slice().into_inner().iter())
+                .enumerate()
+            {
+                if *a != *b {
+                    break 'blk idx;
+                }
+            }
+
+            0
+        };
+
         self.offsets.push(self.data.len() as u16);
-        self.data.put_u16(key.len() as _);
-        self.data.put(key.into_inner());
+        self.data.put_u16(prefix_len as _);
+        self.data.put_u16((key.len() - prefix_len) as _);
+        self.data.put(&key.into_inner()[prefix_len..]);
         self.data.put_u16(value.len() as _);
         self.data.put(value);
+
+        if self.first_key.len() == 0 {
+            self.first_key.set_from_slice(key);
+        }
 
         true
     }
