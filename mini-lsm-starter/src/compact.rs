@@ -162,18 +162,24 @@ impl LsmStorageInner {
                     MergeIterator::create(vec![concat_iter]),
                 )?;
                 let mut builder = SsTableBuilder::new(self.options.block_size);
+                let mut ssts = Vec::new();
                 while iter.is_valid() {
                     if iter.value().len() > 0 {
                         builder.add(iter.key(), iter.value());
+                        if builder.estimated_size() > self.options.target_sst_size {
+                            let id = self.next_sst_id();
+                            let builder = std::mem::replace(
+                                &mut builder,
+                                SsTableBuilder::new(self.options.block_size),
+                            );
+                            ssts.push(Arc::new(builder.build(id, None, self.path_of_sst(id))?))
+                        }
                     }
                     iter.next()?;
                 }
                 let id = self.next_sst_id();
-                Ok(vec![Arc::new(builder.build(
-                    id,
-                    None,
-                    self.path_of_sst(id),
-                )?)])
+                ssts.push(Arc::new(builder.build(id, None, self.path_of_sst(id))?));
+                Ok(ssts)
             }
             _ => unimplemented!(),
         }
