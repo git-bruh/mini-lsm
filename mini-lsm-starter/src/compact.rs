@@ -30,7 +30,10 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
-use crate::iterators::{StorageIterator, merge_iterator::MergeIterator};
+use crate::iterators::{
+    StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
+    two_merge_iterator::TwoMergeIterator,
+};
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -142,7 +145,22 @@ impl LsmStorageInner {
                         sstable,
                     )?));
                 }
-                let mut iter = MergeIterator::create(sstable_iters);
+                let concat_iter = Box::new(SstConcatIterator::create_and_seek_to_first(
+                    l1_sstables
+                        .iter()
+                        .map(|id| {
+                            state
+                                .sstables
+                                .get(id)
+                                .expect("id in l1_sstables but not sstables")
+                                .clone()
+                        })
+                        .collect(),
+                )?);
+                let mut iter = TwoMergeIterator::create(
+                    MergeIterator::create(sstable_iters),
+                    MergeIterator::create(vec![concat_iter]),
+                )?;
                 let mut builder = SsTableBuilder::new(self.options.block_size);
                 while iter.is_valid() {
                     if iter.value().len() > 0 {
@@ -162,16 +180,14 @@ impl LsmStorageInner {
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        let l0_sstables = {
+        let (l0_sstables, l1_sstables) = {
             let state = self.state.read();
-            let mut l0_sstables = state.l0_sstables.clone();
-            l0_sstables.extend_from_slice(&state.levels[0].1);
-            l0_sstables
+            (state.l0_sstables.clone(), state.levels[0].1.clone())
         };
 
         let sstables = self.compact(&CompactionTask::ForceFullCompaction {
             l0_sstables: l0_sstables.clone(),
-            l1_sstables: Vec::new(),
+            l1_sstables: l1_sstables.clone(),
         })?;
 
         {
@@ -194,7 +210,7 @@ impl LsmStorageInner {
                     .l0_sstables
                     .drain(old_ids_begin..new_state.l0_sstables.len());
             }
-            for id in &l0_sstables {
+            for id in l0_sstables.iter().chain(l1_sstables.iter()) {
                 new_state.sstables.remove(id);
             }
             sstables.iter().for_each(|sstable| {

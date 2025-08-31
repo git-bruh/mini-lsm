@@ -33,7 +33,8 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::{
-    StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+    StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
+    two_merge_iterator::TwoMergeIterator,
 };
 use crate::key::{Key, KeyBytes};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
@@ -340,7 +341,24 @@ impl LsmStorageInner {
                 Key::from_slice(key),
             )?));
         }
-        let merge_iter = MergeIterator::create(sstable_iters);
+        let concat_iter = Box::new(SstConcatIterator::create_and_seek_to_key(
+            state.levels.first().map_or(Vec::new(), |l1| {
+                l1.1.iter()
+                    .map(|id| {
+                        state
+                            .sstables
+                            .get(id)
+                            .expect("id in L1 sstables but not sstables")
+                            .clone()
+                    })
+                    .collect()
+            }),
+            Key::from_slice(key),
+        )?);
+        let merge_iter = TwoMergeIterator::create(
+            MergeIterator::create(sstable_iters),
+            MergeIterator::create(vec![concat_iter]),
+        )?;
         if merge_iter.key() == Key::from_slice(key) && merge_iter.value() != [] {
             return Ok(Some(Bytes::copy_from_slice(merge_iter.value())));
         }
@@ -497,10 +515,43 @@ impl LsmStorageInner {
             }
         }
 
+        // L1
+        let l1_sstables = state.levels.first().map_or(Vec::new(), |l1| {
+            l1.1.iter()
+                .map(|id| {
+                    state
+                        .sstables
+                        .get(id)
+                        .expect("id in L1 sstables but not sstables")
+                        .clone()
+                })
+                .filter(|sstable| {
+                    range_overlap(
+                        &begin_key,
+                        &end_key,
+                        sstable.first_key(),
+                        sstable.last_key(),
+                    )
+                })
+                .collect()
+        });
+        let concat_iter = Box::new(match &begin_key {
+            Bound::Included(key) => {
+                SstConcatIterator::create_and_seek_to_key(l1_sstables, key.as_key_slice())
+            }
+            Bound::Excluded(key) => {
+                SstConcatIterator::create_and_seek_after_key(l1_sstables, key.as_key_slice())
+            }
+            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(l1_sstables),
+        }?);
+
         Ok(FusedIterator::new(LsmIterator::new(
             TwoMergeIterator::create(
-                MergeIterator::create(iters),
-                MergeIterator::create(sstable_iters),
+                TwoMergeIterator::create(
+                    MergeIterator::create(iters),
+                    MergeIterator::create(sstable_iters),
+                )?,
+                MergeIterator::create(vec![concat_iter]),
             )?,
             map_bound(upper),
         )?))

@@ -70,6 +70,14 @@ impl SstConcatIterator {
             sstables,
         })
     }
+
+    pub fn create_and_seek_after_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
+        let mut concat_iter = Self::create_and_seek_to_key(sstables, key)?;
+        if concat_iter.is_valid() && concat_iter.key() == key {
+            concat_iter.next()?;
+        }
+        Ok(concat_iter)
+    }
 }
 
 impl StorageIterator for SstConcatIterator {
