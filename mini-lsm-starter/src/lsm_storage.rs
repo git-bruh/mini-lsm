@@ -515,9 +515,11 @@ impl LsmStorageInner {
             }
         }
 
-        // L1
-        let l1_sstables = state.levels.first().map_or(Vec::new(), |l1| {
-            l1.1.iter()
+        let mut concat_iters: Vec<Box<SstConcatIterator>> = Vec::new();
+        for level in state.levels.iter() {
+            let sstables = level
+                .1
+                .iter()
                 .map(|id| {
                     state
                         .sstables
@@ -533,17 +535,17 @@ impl LsmStorageInner {
                         sstable.last_key(),
                     )
                 })
-                .collect()
-        });
-        let concat_iter = Box::new(match &begin_key {
-            Bound::Included(key) => {
-                SstConcatIterator::create_and_seek_to_key(l1_sstables, key.as_key_slice())
-            }
-            Bound::Excluded(key) => {
-                SstConcatIterator::create_and_seek_after_key(l1_sstables, key.as_key_slice())
-            }
-            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(l1_sstables),
-        }?);
+                .collect();
+            concat_iters.push(Box::new(match &begin_key {
+                Bound::Included(key) => {
+                    SstConcatIterator::create_and_seek_to_key(sstables, key.as_key_slice())?
+                }
+                Bound::Excluded(key) => {
+                    SstConcatIterator::create_and_seek_after_key(sstables, key.as_key_slice())?
+                }
+                Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(sstables)?,
+            }));
+        }
 
         Ok(FusedIterator::new(LsmIterator::new(
             TwoMergeIterator::create(
@@ -551,7 +553,7 @@ impl LsmStorageInner {
                     MergeIterator::create(iters),
                     MergeIterator::create(sstable_iters),
                 )?,
-                MergeIterator::create(vec![concat_iter]),
+                MergeIterator::create(concat_iters),
             )?,
             map_bound(upper),
         )?))

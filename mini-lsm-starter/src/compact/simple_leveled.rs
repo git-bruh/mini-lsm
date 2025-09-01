@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use serde::{Deserialize, Serialize};
+use std::{collections::BTreeSet, iter::FromIterator};
 
 use crate::lsm_storage::LsmStorageState;
 
@@ -47,9 +48,37 @@ impl SimpleLeveledCompactionController {
     /// Returns `None` if no compaction needs to be scheduled. The order of SSTs in the compaction task id vector matters.
     pub fn generate_compaction_task(
         &self,
-        _snapshot: &LsmStorageState,
+        snapshot: &LsmStorageState,
     ) -> Option<SimpleLeveledCompactionTask> {
-        unimplemented!()
+        if snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
+            return Some(SimpleLeveledCompactionTask {
+                upper_level: None,
+                upper_level_sst_ids: snapshot.l0_sstables.clone(),
+                lower_level: 0,
+                lower_level_sst_ids: Vec::new(),
+                is_lower_level_bottom_level: false,
+            });
+        }
+
+        for i in 0..(snapshot.levels.len() - 1) {
+            if snapshot.levels[i].1.len() == 0 {
+                continue;
+            }
+
+            if (snapshot.levels[i + 1].1.len() / snapshot.levels[i].1.len() * 100)
+                < self.options.size_ratio_percent
+            {
+                return Some(SimpleLeveledCompactionTask {
+                    upper_level: Some(i),
+                    upper_level_sst_ids: snapshot.levels[i].1.clone(),
+                    lower_level: i + 1,
+                    lower_level_sst_ids: snapshot.levels[i + 1].1.clone(),
+                    is_lower_level_bottom_level: (i + 1) == snapshot.levels.len(),
+                });
+            }
+        }
+
+        None
     }
 
     /// Apply the compaction result.
@@ -61,10 +90,35 @@ impl SimpleLeveledCompactionController {
     /// in your implementation.
     pub fn apply_compaction_result(
         &self,
-        _snapshot: &LsmStorageState,
-        _task: &SimpleLeveledCompactionTask,
-        _output: &[usize],
+        snapshot: &LsmStorageState,
+        task: &SimpleLeveledCompactionTask,
+        output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        unimplemented!()
+        let mut snapshot = snapshot.clone();
+        let mut deleted = Vec::new();
+
+        if let Some(upper_level) = task.upper_level {
+            deleted.extend_from_slice(&task.upper_level_sst_ids);
+            deleted.extend_from_slice(&task.lower_level_sst_ids);
+            let to_remove = BTreeSet::from_iter(&deleted);
+            snapshot.levels[upper_level]
+                .1
+                .retain(|e| !to_remove.contains(e));
+            snapshot.levels[task.lower_level]
+                .1
+                .retain(|e| !to_remove.contains(e));
+            snapshot.levels[task.lower_level]
+                .1
+                .extend_from_slice(output);
+        } else {
+            deleted.extend_from_slice(&task.upper_level_sst_ids);
+            let to_remove = BTreeSet::from_iter(&deleted);
+            snapshot.l0_sstables.retain(|e| !to_remove.contains(e));
+            snapshot.levels[task.lower_level]
+                .1
+                .extend_from_slice(output);
+        }
+
+        (snapshot, deleted)
     }
 }
