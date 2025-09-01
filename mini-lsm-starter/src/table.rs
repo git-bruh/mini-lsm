@@ -52,7 +52,7 @@ impl BlockMeta {
     pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>, hashes: &[u32]) {
         let original_len = buf.len();
         for meta in block_meta {
-            buf.put_u16(meta.offset as _);
+            buf.put_u32(meta.offset as _);
             buf.put_u16(meta.first_key.len() as _);
             buf.put_slice(meta.first_key.as_key_slice().into_inner());
             buf.put_u16(meta.last_key.len() as _);
@@ -69,7 +69,7 @@ impl BlockMeta {
     pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
         let mut meta = Vec::new();
         while buf.has_remaining() {
-            let offset = buf.get_u16() as usize;
+            let offset = buf.get_u32() as usize;
             let first_key_len = buf.get_u16();
             let first_key = KeyBytes::from_bytes(buf.copy_to_bytes(first_key_len as usize));
             let last_key_len = buf.get_u16();

@@ -329,6 +329,9 @@ impl LsmStorageInner {
                             );
                         let deleted = BTreeSet::from_iter(deleted);
                         new_state.sstables.retain(|k, _| !deleted.contains(k));
+                        new_state
+                            .sstables
+                            .extend(ssts.drain(0..).map(|sst| (sst.sst_id(), sst)));
                         let _ = std::mem::replace(&mut *state, Arc::new(new_state));
                         deleted
                     };

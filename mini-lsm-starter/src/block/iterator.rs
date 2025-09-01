@@ -87,8 +87,10 @@ impl BlockIterator {
 
     /// Seeks to the last key in the block
     pub fn seek_to_last(&mut self) {
-        self.idx = self.block.offsets.len() - 1;
-        self.next()
+        if self.block.offsets.len() > 0 {
+            self.idx = self.block.offsets.len() - 1;
+            self.next();
+        }
     }
 
     /// Move to the next key in the block.
