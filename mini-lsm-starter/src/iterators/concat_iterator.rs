@@ -35,14 +35,16 @@ pub struct SstConcatIterator {
 
 impl SstConcatIterator {
     pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
-        Ok(Self {
+        let mut iter = Self {
             current: sstables
                 .first()
                 .map(|sstable| SsTableIterator::create_and_seek_to_first(sstable.clone()))
                 .transpose()?,
             next_sst_idx: 1,
             sstables,
-        })
+        };
+        iter.move_until_valid()?;
+        Ok(iter)
     }
 
     pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
@@ -62,13 +64,14 @@ impl SstConcatIterator {
             Some(0)
         };
 
-        Ok(Self {
+        let mut iter = Self {
             current: sstable_idx
                 .map(|idx| SsTableIterator::create_and_seek_to_key(sstables[idx].clone(), key))
                 .transpose()?,
             next_sst_idx: sstable_idx.map_or(0, |idx| idx + 1),
             sstables,
-        })
+        };
+        Ok(iter)
     }
 
     pub fn create_and_seek_after_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
@@ -77,6 +80,23 @@ impl SstConcatIterator {
             concat_iter.next()?;
         }
         Ok(concat_iter)
+    }
+
+    fn move_until_valid(&mut self) -> Result<()> {
+        while let Some(iter) = self.current.as_mut() {
+            if iter.is_valid() {
+                break;
+            }
+            if self.next_sst_idx >= self.sstables.len() {
+                self.current = None;
+            } else {
+                self.current = Some(SsTableIterator::create_and_seek_to_first(
+                    self.sstables[self.next_sst_idx].clone(),
+                )?);
+                self.next_sst_idx += 1;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -104,21 +124,11 @@ impl StorageIterator for SstConcatIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        if let Some(current) = self.current.as_mut()
-            && current.is_valid()
-        {
-            return current.next();
-        }
-
-        if self.next_sst_idx < self.sstables.len() {
-            self.current = Some(SsTableIterator::create_and_seek_to_first(
-                self.sstables[self.next_sst_idx].clone(),
-            )?);
-            self.next_sst_idx += 1;
-        } else {
-            self.current = None;
-        };
-
+        self.current
+            .as_mut()
+            .expect("next() called on invalid concat iterator")
+            .next()?;
+        self.move_until_valid()?;
         Ok(())
     }
 

@@ -73,7 +73,7 @@ impl SimpleLeveledCompactionController {
                     upper_level_sst_ids: snapshot.levels[i].1.clone(),
                     lower_level: i + 1,
                     lower_level_sst_ids: snapshot.levels[i + 1].1.clone(),
-                    is_lower_level_bottom_level: (i + 1) == snapshot.levels.len(),
+                    is_lower_level_bottom_level: (i + 1) == self.options.max_levels,
                 });
             }
         }
@@ -107,18 +107,15 @@ impl SimpleLeveledCompactionController {
             snapshot.levels[task.lower_level]
                 .1
                 .retain(|e| !to_remove.contains(e));
-            snapshot.levels[task.lower_level]
-                .1
-                .extend_from_slice(output);
         } else {
             deleted.extend_from_slice(&task.upper_level_sst_ids);
             let to_remove = BTreeSet::from_iter(&deleted);
             snapshot.l0_sstables.retain(|e| !to_remove.contains(e));
-            snapshot.levels[task.lower_level]
-                .1
-                .extend_from_slice(output);
         }
 
+        snapshot.levels[task.lower_level]
+            .1
+            .extend_from_slice(output);
         (snapshot, deleted)
     }
 }

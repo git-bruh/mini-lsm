@@ -329,6 +329,10 @@ impl LsmStorageInner {
                 .expect("id in l0_sstables but no sstables")
                 .clone();
 
+            if !(sstable.first_key().raw_ref() <= key && sstable.last_key().raw_ref() >= key) {
+                continue;
+            }
+
             if let Some(bloom) = &sstable.bloom {
                 let h = farmhash::fingerprint32(key);
                 if !bloom.may_contain(h) {
@@ -341,23 +345,45 @@ impl LsmStorageInner {
                 Key::from_slice(key),
             )?));
         }
-        let concat_iter = Box::new(SstConcatIterator::create_and_seek_to_key(
-            state.levels.first().map_or(Vec::new(), |l1| {
-                l1.1.iter()
-                    .map(|id| {
-                        state
-                            .sstables
-                            .get(id)
-                            .expect("id in L1 sstables but not sstables")
-                            .clone()
-                    })
-                    .collect()
-            }),
-            Key::from_slice(key),
-        )?);
+
+        let mut concat_iters: Vec<Box<SstConcatIterator>> = Vec::new();
+        for level in state.levels.iter() {
+            let sstables = level
+                .1
+                .iter()
+                .map(|id| {
+                    state
+                        .sstables
+                        .get(id)
+                        .expect("id in L1 sstables but not sstables")
+                        .clone()
+                })
+                .filter(|sstable| {
+                    if !(sstable.first_key().raw_ref() <= key
+                        && sstable.last_key().raw_ref() >= key)
+                    {
+                        return false;
+                    }
+
+                    if let Some(bloom) = &sstable.bloom {
+                        let h = farmhash::fingerprint32(key);
+                        if !bloom.may_contain(h) {
+                            return false;
+                        }
+                    }
+
+                    true
+                })
+                .collect();
+            concat_iters.push(Box::new(SstConcatIterator::create_and_seek_to_key(
+                sstables,
+                Key::from_slice(key),
+            )?));
+        }
+
         let merge_iter = TwoMergeIterator::create(
             MergeIterator::create(sstable_iters),
-            MergeIterator::create(vec![concat_iter]),
+            MergeIterator::create(concat_iters),
         )?;
         if merge_iter.key() == Key::from_slice(key) && merge_iter.value() != [] {
             return Ok(Some(Bytes::copy_from_slice(merge_iter.value())));
