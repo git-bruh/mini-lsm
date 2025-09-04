@@ -472,7 +472,13 @@ impl LsmStorageInner {
             SsTableBuilder::new(self.options.block_size),
             self.path_of_sst(imm_memtable.id()),
         )?;
-        state.l0_sstables.insert(0, sstable.sst_id());
+        if self.compaction_controller.flush_to_l0() {
+            state.l0_sstables.insert(0, sstable.sst_id());
+        } else {
+            state
+                .levels
+                .insert(0, (sstable.sst_id(), vec![sstable.sst_id()]));
+        }
         state.sstables.insert(sstable.sst_id(), Arc::new(sstable));
 
         let _ = std::mem::replace(&mut *self.state.write(), Arc::new(state));

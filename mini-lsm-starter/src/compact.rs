@@ -346,6 +346,50 @@ impl LsmStorageInner {
                         std::fs::remove_file(self.path_of_sst(id))?;
                     }
                 }
+                CompactionTask::Tiered(TieredCompactionTask {
+                    tiers,
+                    bottom_tier_included,
+                }) => {
+                    let mut concat_iters: Vec<Box<SstConcatIterator>> = Vec::new();
+                    for (_, ssts) in tiers {
+                        concat_iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
+                            ssts.iter()
+                                .map(|id| {
+                                    state.sstables.get(id).expect("id not in sstables").clone()
+                                })
+                                .collect(),
+                        )?));
+                    }
+                    let mut ssts = self.compact_generate_sst_from_iter(
+                        MergeIterator::create(concat_iters),
+                        *bottom_tier_included,
+                    )?;
+                    let deleted = {
+                        let state_lock = self.state_lock.lock();
+                        let mut state = self.state.write();
+                        let (mut new_state, deleted) =
+                            self.compaction_controller.apply_compaction_result(
+                                &state,
+                                &task,
+                                &ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>(),
+                                false,
+                            );
+                        let deleted = BTreeSet::from_iter(deleted);
+                        new_state.sstables.retain(|k, _| !deleted.contains(k));
+                        println!(
+                            "compaction finished: {deleted:?} removed, {:?} added",
+                            ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>()
+                        );
+                        new_state
+                            .sstables
+                            .extend(ssts.drain(0..).map(|sst| (sst.sst_id(), sst)));
+                        let _ = std::mem::replace(&mut *state, Arc::new(new_state));
+                        deleted
+                    };
+                    for id in deleted {
+                        std::fs::remove_file(self.path_of_sst(id))?;
+                    }
+                }
                 _ => unreachable!(),
             };
         }
