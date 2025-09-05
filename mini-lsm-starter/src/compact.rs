@@ -362,7 +362,7 @@ impl LsmStorageInner {
                     }
                     let mut ssts = self.compact_generate_sst_from_iter(
                         MergeIterator::create(concat_iters),
-                        *bottom_tier_included,
+                        task.compact_to_bottom_level(),
                     )?;
                     let deleted = {
                         let state_lock = self.state_lock.lock();

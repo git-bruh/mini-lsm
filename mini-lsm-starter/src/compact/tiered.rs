@@ -96,21 +96,24 @@ impl TieredCompactionController {
         output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
         let mut snapshot = snapshot.clone();
+        let deleted = task.tiers.iter().map(|(id, _)| *id).collect::<Vec<_>>();
 
-        // full compaction
-        if task.bottom_tier_included {
-            let mut deleted = Vec::new();
-            for (_, ssts) in snapshot.levels {
-                deleted.extend(ssts);
+        let mut levels = Vec::new();
+        let mut new_tier_pushed = false;
+        let mut deleted_set = BTreeSet::from_iter(&deleted);
+        for (level, ssts) in snapshot.levels {
+            if !deleted_set.remove(&level) {
+                levels.push((level, ssts));
             }
-            snapshot.levels = vec![(output[0], output.to_vec())];
-            return (snapshot, deleted);
+
+            if deleted_set.len() == 0 && !new_tier_pushed {
+                levels.push((output[0], output.to_vec()));
+                new_tier_pushed = true;
+            }
         }
+        assert_eq!(deleted_set.len(), 0);
 
-        let deleted = BTreeSet::from_iter(task.tiers.iter().map(|(id, _)| id));
-        snapshot.levels.retain(|(id, _)| !deleted.contains(id));
-        snapshot.levels.insert(0, (output[0], output.to_vec()));
-
-        (snapshot, deleted.iter().map(|id| **id).collect::<Vec<_>>())
+        snapshot.levels = levels;
+        (snapshot, deleted)
     }
 }
