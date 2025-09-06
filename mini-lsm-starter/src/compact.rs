@@ -157,12 +157,12 @@ impl LsmStorageInner {
     }
 
     fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        let state = Arc::clone(&self.state.read());
         match task {
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
                 l1_sstables,
             } => {
-                let state = Arc::clone(&self.state.read());
                 let mut sstable_iters: Vec<Box<SsTableIterator>> = Vec::new();
                 for id in l0_sstables {
                     let sstable = state
@@ -190,7 +190,95 @@ impl LsmStorageInner {
                     TwoMergeIterator::create(MergeIterator::create(sstable_iters), concat_iter)?;
                 self.compact_generate_sst_from_iter(iter, task.compact_to_bottom_level())
             }
-            _ => unimplemented!(),
+            CompactionTask::Simple(SimpleLeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level,
+                lower_level_sst_ids,
+                ..
+            })
+            | CompactionTask::Leveled(LeveledCompactionTask {
+                upper_level,
+                upper_level_sst_ids,
+                lower_level,
+                lower_level_sst_ids,
+                ..
+            }) => {
+                let mut sstable_iters: Vec<Box<SsTableIterator>> = Vec::new();
+                let mut upper_sstables: Vec<Arc<SsTable>> = Vec::new();
+                let mut lower_sstables: Vec<Arc<SsTable>> = Vec::new();
+                if upper_level.is_none() {
+                    for id in upper_level_sst_ids {
+                        sstable_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
+                            state
+                                .sstables
+                                .get(id)
+                                .expect("id in upper_level_sst_ids but not sstables")
+                                .clone(),
+                        )?));
+                    }
+                } else {
+                    upper_sstables.extend(
+                        upper_level_sst_ids
+                            .iter()
+                            .map(|id| {
+                                state
+                                    .sstables
+                                    .get(id)
+                                    .expect("id in upper_level_sst_ids but not sstables")
+                                    .clone()
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                };
+                lower_sstables.extend(
+                    lower_level_sst_ids
+                        .iter()
+                        .map(|id| {
+                            state
+                                .sstables
+                                .get(id)
+                                .expect("id in lower_level_sst_ids but not sstables")
+                                .clone()
+                        })
+                        .collect::<Vec<_>>(),
+                );
+
+                if sstable_iters.len() > 0 {
+                    self.compact_generate_sst_from_iter(
+                        TwoMergeIterator::create(
+                            MergeIterator::create(sstable_iters),
+                            SstConcatIterator::create_and_seek_to_first(lower_sstables)?,
+                        )?,
+                        task.compact_to_bottom_level(),
+                    )
+                } else {
+                    self.compact_generate_sst_from_iter(
+                        TwoMergeIterator::create(
+                            SstConcatIterator::create_and_seek_to_first(upper_sstables)?,
+                            SstConcatIterator::create_and_seek_to_first(lower_sstables)?,
+                        )?,
+                        task.compact_to_bottom_level(),
+                    )
+                }
+            }
+            CompactionTask::Tiered(TieredCompactionTask {
+                tiers,
+                bottom_tier_included,
+            }) => {
+                let mut concat_iters: Vec<Box<SstConcatIterator>> = Vec::new();
+                for (_, ssts) in tiers {
+                    concat_iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
+                        ssts.iter()
+                            .map(|id| state.sstables.get(id).expect("id not in sstables").clone())
+                            .collect(),
+                    )?));
+                }
+                self.compact_generate_sst_from_iter(
+                    MergeIterator::create(concat_iters),
+                    task.compact_to_bottom_level(),
+                )
+            }
         }
     }
 
@@ -252,146 +340,27 @@ impl LsmStorageInner {
                 println!("L{level} ({}): {:?}", files.len(), files);
             }
 
-            match &task {
-                CompactionTask::Simple(SimpleLeveledCompactionTask {
-                    upper_level,
-                    upper_level_sst_ids,
-                    lower_level,
-                    lower_level_sst_ids,
-                    ..
-                }) => {
-                    let mut sstable_iters: Vec<Box<SsTableIterator>> = Vec::new();
-                    let mut upper_sstables: Vec<Arc<SsTable>> = Vec::new();
-                    let mut lower_sstables: Vec<Arc<SsTable>> = Vec::new();
-                    if upper_level.is_none() {
-                        for id in upper_level_sst_ids {
-                            sstable_iters.push(Box::new(
-                                SsTableIterator::create_and_seek_to_first(
-                                    state
-                                        .sstables
-                                        .get(id)
-                                        .expect("id in upper_level_sst_ids but not sstables")
-                                        .clone(),
-                                )?,
-                            ));
-                        }
-                    } else {
-                        upper_sstables.extend(
-                            upper_level_sst_ids
-                                .iter()
-                                .map(|id| {
-                                    state
-                                        .sstables
-                                        .get(id)
-                                        .expect("id in upper_level_sst_ids but not sstables")
-                                        .clone()
-                                })
-                                .collect::<Vec<_>>(),
-                        );
-                    };
-                    lower_sstables.extend(
-                        lower_level_sst_ids
-                            .iter()
-                            .map(|id| {
-                                state
-                                    .sstables
-                                    .get(id)
-                                    .expect("id in lower_level_sst_ids but not sstables")
-                                    .clone()
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-
-                    let mut ssts = if sstable_iters.len() > 0 {
-                        self.compact_generate_sst_from_iter(
-                            TwoMergeIterator::create(
-                                MergeIterator::create(sstable_iters),
-                                SstConcatIterator::create_and_seek_to_first(lower_sstables)?,
-                            )?,
-                            task.compact_to_bottom_level(),
-                        )?
-                    } else {
-                        self.compact_generate_sst_from_iter(
-                            TwoMergeIterator::create(
-                                SstConcatIterator::create_and_seek_to_first(upper_sstables)?,
-                                SstConcatIterator::create_and_seek_to_first(lower_sstables)?,
-                            )?,
-                            task.compact_to_bottom_level(),
-                        )?
-                    };
-
-                    let deleted = {
-                        let state_lock = self.state_lock.lock();
-                        let mut state = self.state.write();
-                        let (mut new_state, deleted) =
-                            self.compaction_controller.apply_compaction_result(
-                                &state,
-                                &task,
-                                &ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>(),
-                                false,
-                            );
-                        let deleted = BTreeSet::from_iter(deleted);
-                        new_state.sstables.retain(|k, _| !deleted.contains(k));
-                        println!(
-                            "compaction finished: {deleted:?} removed, {:?} added",
-                            ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>()
-                        );
-                        new_state
-                            .sstables
-                            .extend(ssts.drain(0..).map(|sst| (sst.sst_id(), sst)));
-                        let _ = std::mem::replace(&mut *state, Arc::new(new_state));
-                        deleted
-                    };
-                    for id in deleted {
-                        std::fs::remove_file(self.path_of_sst(id))?;
-                    }
-                }
-                CompactionTask::Tiered(TieredCompactionTask {
-                    tiers,
-                    bottom_tier_included,
-                }) => {
-                    let mut concat_iters: Vec<Box<SstConcatIterator>> = Vec::new();
-                    for (_, ssts) in tiers {
-                        concat_iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
-                            ssts.iter()
-                                .map(|id| {
-                                    state.sstables.get(id).expect("id not in sstables").clone()
-                                })
-                                .collect(),
-                        )?));
-                    }
-                    let mut ssts = self.compact_generate_sst_from_iter(
-                        MergeIterator::create(concat_iters),
-                        task.compact_to_bottom_level(),
-                    )?;
-                    let deleted = {
-                        let state_lock = self.state_lock.lock();
-                        let mut state = self.state.write();
-                        let (mut new_state, deleted) =
-                            self.compaction_controller.apply_compaction_result(
-                                &state,
-                                &task,
-                                &ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>(),
-                                false,
-                            );
-                        let deleted = BTreeSet::from_iter(deleted);
-                        new_state.sstables.retain(|k, _| !deleted.contains(k));
-                        println!(
-                            "compaction finished: {deleted:?} removed, {:?} added",
-                            ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>()
-                        );
-                        new_state
-                            .sstables
-                            .extend(ssts.drain(0..).map(|sst| (sst.sst_id(), sst)));
-                        let _ = std::mem::replace(&mut *state, Arc::new(new_state));
-                        deleted
-                    };
-                    for id in deleted {
-                        std::fs::remove_file(self.path_of_sst(id))?;
-                    }
-                }
-                _ => unreachable!(),
+            let mut ssts = self.compact(&task)?;
+            let deleted = {
+                let state_lock = self.state_lock.lock();
+                let mut state = self.state.write();
+                let mut new_state = state.as_ref().clone();
+                let sst_ids = ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>();
+                new_state
+                    .sstables
+                    .extend(ssts.drain(0..).map(|sst| (sst.sst_id(), sst)));
+                let (mut new_state, deleted) = self
+                    .compaction_controller
+                    .apply_compaction_result(&new_state, &task, &sst_ids, false);
+                let deleted = BTreeSet::from_iter(deleted);
+                new_state.sstables.retain(|k, _| !deleted.contains(k));
+                println!("compaction finished: {deleted:?} removed, {sst_ids:?} added",);
+                let _ = std::mem::replace(&mut *state, Arc::new(new_state));
+                deleted
             };
+            for id in deleted {
+                std::fs::remove_file(self.path_of_sst(id))?;
+            }
         }
         Ok(())
     }

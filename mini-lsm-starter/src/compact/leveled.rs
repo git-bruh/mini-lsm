@@ -46,65 +46,111 @@ impl LeveledCompactionController {
 
     fn find_overlapping_ssts(
         &self,
-        _snapshot: &LsmStorageState,
-        _sst_ids: &[usize],
-        _in_level: usize,
+        snapshot: &LsmStorageState,
+        sst_ids: &[usize],
+        in_level: usize,
     ) -> Vec<usize> {
-        unimplemented!()
+        let mut ssts = Vec::new();
+        let sstables = sst_ids
+            .iter()
+            .map(|sst| snapshot.sstables.get(sst).expect("sst not found"))
+            .collect::<Vec<_>>();
+        let first_key = sstables
+            .iter()
+            .map(|sstable| sstable.first_key())
+            .min()
+            .expect("empty sst_ids")
+            .as_key_slice();
+        let last_key = sstables
+            .iter()
+            .map(|sstable| sstable.last_key())
+            .max()
+            .expect("empty sst_ids")
+            .as_key_slice();
+        for sst in &snapshot.levels[in_level].1 {
+            let sstable = snapshot.sstables.get(sst).expect("sst not found");
+            if !(sstable.last_key().as_key_slice() < first_key
+                || sstable.first_key().as_key_slice() > last_key)
+            {
+                ssts.push(*sst);
+            }
+        }
+        ssts
     }
 
     pub fn generate_compaction_task(
         &self,
         snapshot: &LsmStorageState,
     ) -> Option<LeveledCompactionTask> {
-        let target_sizes = snapshot.levels.iter().enumerate().map(|(idx, (_, ssts))| {
-            if ssts.len() == 0 {
-                (idx, 0)
-            } else {
-                (
-                    idx,
-                    self.options.base_level_size_mb
-                        / (self.options.level_size_multiplier
-                            * (self.options.max_levels - idx - 1))
-                            .min(1),
-                )
+        let level_size = |idx: usize| {
+            snapshot.levels[idx]
+                .1
+                .iter()
+                .map(|sst| {
+                    snapshot
+                        .sstables
+                        .get(sst)
+                        .expect("sstable not found")
+                        .table_size() as usize
+                        / (1024 * 1024)
+                })
+                .sum::<usize>()
+        };
+
+        let mut target_sizes = snapshot.levels.iter().map(|_| 0).collect::<Vec<_>>();
+        target_sizes[snapshot.levels.len() - 1] =
+            level_size(snapshot.levels.len() - 1).max(self.options.base_level_size_mb);
+
+        for level in (0..snapshot.levels.len() - 1).rev() {
+            if target_sizes[level + 1] > self.options.base_level_size_mb {
+                target_sizes[level] = target_sizes[level + 1] / self.options.level_size_multiplier;
             }
-        });
+        }
 
         if snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
             let level_idx = target_sizes
-                .filter(|(_, target_size)| *target_size > 0)
+                .iter()
+                .enumerate()
+                .filter(|(_, size)| **size > 0)
                 .nth(0)
-                .map_or(snapshot.levels.len() - 1, |(idx, _)| idx);
+                .expect("all target sizes 0")
+                .0;
+            println!("flushing L0 SSTs to level {level_idx}");
+
             return Some(LeveledCompactionTask {
                 upper_level: None,
                 upper_level_sst_ids: snapshot.l0_sstables.clone(),
-                lower_level: snapshot.levels[level_idx].0,
-                lower_level_sst_ids: snapshot.levels[level_idx].1.clone(),
+                lower_level: level_idx,
+                lower_level_sst_ids: self.find_overlapping_ssts(
+                    snapshot,
+                    &snapshot.l0_sstables,
+                    level_idx,
+                ),
                 is_lower_level_bottom_level: (level_idx + 1) == snapshot.levels.len(),
             });
         }
 
         let mut sorted_ratios = target_sizes
-            .filter(|(idx, target_size)| {
-                snapshot
-                    .sstables
-                    .get(idx)
-                    .expect("sstable not found")
-                    .file
-                    .size() as f64
-                    / *target_size as f64
-                    > 1.0
-            })
+            .iter()
+            .enumerate()
+            .map(|(idx, target_size)| (idx, level_size(idx) as f64 / *target_size as f64))
+            .filter(|(_, ratio)| *ratio > 1.0)
             .collect::<Vec<_>>();
-        sorted_ratios.sort_by(|(_, ratio_a), (_, ratio_b)| ratio_a.cmp(ratio_b));
-        if sorted_ratios.len() >= 2 {
-            let (upper, lower) = (sorted_ratios[0].0, sorted_ratios[1].0);
+        sorted_ratios.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+        if let Some((upper, _)) = sorted_ratios.first() {
+            let upper = *upper;
+            let upper_sst = *snapshot.levels[upper]
+                .1
+                .iter()
+                .min()
+                .expect("upper level empty");
+            let lower = upper + 1;
             return Some(LeveledCompactionTask {
-                upper_level: Some(snapshot.levels[upper].0),
-                upper_level_sst_ids: snapshot.levels[upper].1.clone(),
-                lower_level: snapshot.levels[lower].0,
-                lower_level_sst_ids: snapshot.levels[lower].1.clone(),
+                upper_level: Some(upper),
+                upper_level_sst_ids: vec![upper_sst],
+                lower_level: lower,
+                lower_level_sst_ids: self.find_overlapping_ssts(snapshot, &[upper_sst], lower),
                 is_lower_level_bottom_level: (lower + 1) == snapshot.levels.len(),
             });
         }
@@ -122,26 +168,32 @@ impl LeveledCompactionController {
         let mut snapshot = snapshot.clone();
         let mut deleted = Vec::new();
 
+        deleted.extend_from_slice(&task.upper_level_sst_ids);
+        deleted.extend_from_slice(&task.lower_level_sst_ids);
+        let to_remove = BTreeSet::from_iter(&deleted);
+
         if let Some(upper_level) = task.upper_level {
-            deleted.extend_from_slice(&task.upper_level_sst_ids);
-            deleted.extend_from_slice(&task.lower_level_sst_ids);
-            let to_remove = BTreeSet::from_iter(&deleted);
             snapshot.levels[upper_level]
                 .1
                 .retain(|e| !to_remove.contains(e));
-            snapshot.levels[task.lower_level]
-                .1
-                .retain(|e| !to_remove.contains(e));
         } else {
-            deleted.extend_from_slice(&task.upper_level_sst_ids);
-            let to_remove = BTreeSet::from_iter(&deleted);
             snapshot.l0_sstables.retain(|e| !to_remove.contains(e));
         }
-
+        snapshot.levels[task.lower_level]
+            .1
+            .retain(|e| !to_remove.contains(e));
         snapshot.levels[task.lower_level]
             .1
             .extend_from_slice(output);
 
+        snapshot.levels[task.lower_level].1.sort_by(|a, b| {
+            snapshot
+                .sstables
+                .get(a)
+                .expect("sst not found")
+                .first_key()
+                .cmp(snapshot.sstables.get(b).expect("sst not found").first_key())
+        });
         (snapshot, deleted)
     }
 }
