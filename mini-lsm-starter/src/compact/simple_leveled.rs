@@ -55,7 +55,7 @@ impl SimpleLeveledCompactionController {
                 upper_level: None,
                 upper_level_sst_ids: snapshot.l0_sstables.clone(),
                 lower_level: 0,
-                lower_level_sst_ids: Vec::new(),
+                lower_level_sst_ids: snapshot.levels[0].1.clone(),
                 is_lower_level_bottom_level: false,
             });
         }
@@ -113,9 +113,7 @@ impl SimpleLeveledCompactionController {
             snapshot.l0_sstables.retain(|e| !to_remove.contains(e));
         }
 
-        snapshot.levels[task.lower_level]
-            .1
-            .extend_from_slice(output);
+        snapshot.levels[task.lower_level].1 = output.to_vec();
         (snapshot, deleted)
     }
 }
