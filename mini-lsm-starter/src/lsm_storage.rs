@@ -15,7 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,7 +66,7 @@ pub enum WriteBatchRecord<T: AsRef<[u8]>> {
 }
 
 impl LsmStorageState {
-    fn create(options: &LsmStorageOptions) -> Self {
+    fn create(options: &LsmStorageOptions) -> Result<Self> {
         let levels = match &options.compaction_options {
             CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })
             | CompactionOptions::Simple(SimpleLeveledCompactionOptions { max_levels, .. }) => (1
@@ -76,13 +76,14 @@ impl LsmStorageState {
             CompactionOptions::Tiered(_) => Vec::new(),
             CompactionOptions::NoCompaction => vec![(1, Vec::new())],
         };
-        Self {
+
+        Ok(Self {
             memtable: Arc::new(MemTable::create(0)),
             imm_memtables: Vec::new(),
             l0_sstables: Vec::new(),
             levels,
             sstables: Default::default(),
-        }
+        })
     }
 }
 
@@ -275,7 +276,7 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
-        let state = LsmStorageState::create(&options);
+        let state = LsmStorageState::create(&options)?;
 
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
@@ -305,6 +306,22 @@ impl LsmStorageInner {
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
 
+        // first time manifest creation
+        if storage.options.enable_wal && records.len() == 0 {
+            let mut state = storage.state.read().as_ref().clone();
+            let wal_memtable = MemTable::create_with_wal(
+                state.memtable.id(),
+                Self::path_of_wal_static(path, state.memtable.id()),
+            )?;
+            if let Some(manifest) = &storage.manifest {
+                manifest.add_record_when_init(ManifestRecord::NewMemtable(wal_memtable.id()))?;
+            }
+            state.memtable = Arc::new(wal_memtable);
+        }
+
+        let mut max_sst_id = 1;
+        let mut memtables = BTreeSet::new();
+
         let mut state = storage.state.read().as_ref().clone();
         for record in records {
             match record {
@@ -315,14 +332,24 @@ impl LsmStorageInner {
                     state = new_state;
                 }
                 ManifestRecord::Flush(sst) => {
-                    state.l0_sstables.insert(0, sst);
+                    memtables.remove(&sst);
+
+                    if storage.compaction_controller.flush_to_l0() {
+                        state.l0_sstables.insert(0, sst);
+                    } else {
+                        state.levels.insert(0, (sst, vec![sst]));
+                    }
                 }
-                _ => continue,
+                ManifestRecord::NewMemtable(id) => {
+                    if id > max_sst_id {
+                        max_sst_id = id;
+                    }
+                    memtables.insert(id);
+                }
             };
         }
 
         {
-            let mut max_sst_id = 1;
             let mut push = |sst| -> Result<()> {
                 if sst > max_sst_id {
                     max_sst_id = sst;
@@ -345,6 +372,22 @@ impl LsmStorageInner {
                 for sst in ssts {
                     push(*sst)?;
                 }
+            }
+
+            if storage.options.enable_wal {
+                for id in memtables.iter().rev() {
+                    state
+                        .imm_memtables
+                        .push(Arc::new(MemTable::recover_from_wal(
+                            *id,
+                            Self::path_of_wal_static(path, *id),
+                        )?));
+                }
+                max_sst_id += 1;
+                state.memtable = Arc::new(MemTable::create_with_wal(
+                    max_sst_id,
+                    Self::path_of_wal_static(path, max_sst_id),
+                )?);
             }
 
             // sort bottom level SSTs
@@ -375,7 +418,7 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        self.state.read().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -517,8 +560,18 @@ impl LsmStorageInner {
         let mut state = self.state.write();
         let mut imm_memtables = state.imm_memtables.clone();
         imm_memtables.insert(0, state.memtable.clone());
+        let memtable = if self.options.enable_wal {
+            let id = self.next_sst_id();
+            let memtable = MemTable::create_with_wal(id, self.path_of_wal(id))?;
+            if let Some(manifest) = &self.manifest {
+                manifest.add_record(_state_lock_observer, ManifestRecord::NewMemtable(id))?;
+            }
+            memtable
+        } else {
+            MemTable::create(self.next_sst_id())
+        };
         let new_state = LsmStorageState {
-            memtable: Arc::new(MemTable::create(self.next_sst_id())),
+            memtable: Arc::new(memtable),
             imm_memtables,
             l0_sstables: state.l0_sstables.clone(),
             levels: state.levels.clone(),
