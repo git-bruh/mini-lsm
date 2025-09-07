@@ -21,8 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use std::io::Write;
-
 use anyhow::Result;
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -30,7 +28,8 @@ use parking_lot::{Mutex, MutexGuard, RwLock};
 use crate::block::Block;
 use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
-    SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
+    LeveledCompactionTask, SimpleLeveledCompactionController, SimpleLeveledCompactionOptions,
+    TieredCompactionController,
 };
 use crate::iterators::{
     StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
@@ -38,10 +37,10 @@ use crate::iterators::{
 };
 use crate::key::{Key, KeyBytes};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -180,6 +179,15 @@ impl MiniLsm {
         if let Some(handle) = self.flush_thread.lock().take() {
             handle.join().expect("joining handle failed");
         }
+        if !self.inner.options.enable_wal {
+            while !self.inner.state.read().memtable.is_empty() {
+                self.inner
+                    .force_freeze_memtable(&self.inner.state_lock.lock())?;
+            }
+            while !self.inner.state.read().imm_memtables.is_empty() {
+                self.inner.force_flush_next_imm_memtable()?;
+            }
+        }
         Ok(())
     }
 
@@ -282,6 +290,8 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
+        let (manifest, records) = Manifest::recover(path.join("MANIFEST"))?;
+
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
@@ -289,11 +299,77 @@ impl LsmStorageInner {
             block_cache: Arc::new(BlockCache::new(1024)),
             next_sst_id: AtomicUsize::new(1),
             compaction_controller,
-            manifest: None,
+            manifest: Some(manifest),
             options: options.into(),
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
+
+        let mut state = storage.state.read().as_ref().clone();
+        for record in records {
+            match record {
+                ManifestRecord::Compaction(task, output) => {
+                    let (new_state, _) = storage
+                        .compaction_controller
+                        .apply_compaction_result(&state, &task, &output, true);
+                    state = new_state;
+                }
+                ManifestRecord::Flush(sst) => {
+                    state.l0_sstables.insert(0, sst);
+                }
+                _ => continue,
+            };
+        }
+
+        {
+            let mut max_sst_id = 1;
+            let mut push = |sst| -> Result<()> {
+                if sst > max_sst_id {
+                    max_sst_id = sst;
+                }
+                state.sstables.insert(
+                    sst,
+                    Arc::new(SsTable::open(
+                        sst,
+                        Some(storage.block_cache.clone()),
+                        FileObject::open(&storage.path_of_sst(sst))?,
+                    )?),
+                );
+                Ok(())
+            };
+
+            for sst in &state.l0_sstables {
+                push(*sst)?;
+            }
+            for (_, ssts) in &state.levels {
+                for sst in ssts {
+                    push(*sst)?;
+                }
+            }
+
+            // sort bottom level SSTs
+            if let CompactionController::Leveled(ctrl) = &storage.compaction_controller {
+                let (new_state, _) = ctrl.apply_compaction_result(
+                    &state,
+                    &LeveledCompactionTask {
+                        upper_level: None,
+                        upper_level_sst_ids: Vec::new(),
+                        lower_level: state.levels.len() - 1,
+                        lower_level_sst_ids: Vec::new(),
+                        is_lower_level_bottom_level: true,
+                    },
+                    &[],
+                    false,
+                );
+                *storage.state.write() = Arc::new(new_state);
+            } else {
+                *storage.state.write() = Arc::new(state);
+            }
+
+            storage
+                .next_sst_id
+                .store(max_sst_id + 1, std::sync::atomic::Ordering::SeqCst);
+        }
 
         Ok(storage)
     }
@@ -326,7 +402,7 @@ impl LsmStorageInner {
             let sstable = state
                 .sstables
                 .get(id)
-                .expect("id in l0_sstables but no sstables")
+                .expect("id in l0_sstables but not sstables")
                 .clone();
 
             if !(sstable.first_key().raw_ref() <= key && sstable.last_key().raw_ref() >= key) {
@@ -385,7 +461,7 @@ impl LsmStorageInner {
             MergeIterator::create(sstable_iters),
             MergeIterator::create(concat_iters),
         )?;
-        if merge_iter.key() == Key::from_slice(key) && merge_iter.value() != [] {
+        if merge_iter.key() == Key::from_slice(key) && !merge_iter.value().is_empty() {
             return Ok(Some(Bytes::copy_from_slice(merge_iter.value())));
         }
 
@@ -478,6 +554,12 @@ impl LsmStorageInner {
             state
                 .levels
                 .insert(0, (sstable.sst_id(), vec![sstable.sst_id()]));
+        }
+        if let Some(manifest) = &self.manifest {
+            manifest.add_record(
+                &_state_lock_observer,
+                ManifestRecord::Flush(sstable.sst_id()),
+            )?;
         }
         state.sstables.insert(sstable.sst_id(), Arc::new(sstable));
 

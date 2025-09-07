@@ -64,7 +64,7 @@ impl SstConcatIterator {
             Some(0)
         };
 
-        let mut iter = Self {
+        let iter = Self {
             current: sstable_idx
                 .map(|idx| SsTableIterator::create_and_seek_to_key(sstables[idx].clone(), key))
                 .transpose()?,

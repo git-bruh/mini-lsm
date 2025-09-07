@@ -24,6 +24,7 @@ use std::time::Duration;
 use std::{collections::BTreeSet, iter::FromIterator};
 
 use crate::key::KeySlice;
+use crate::manifest::ManifestRecord;
 use anyhow::Result;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
@@ -288,10 +289,11 @@ impl LsmStorageInner {
             (state.l0_sstables.clone(), state.levels[0].1.clone())
         };
 
-        let sstables = self.compact(&CompactionTask::ForceFullCompaction {
+        let task = CompactionTask::ForceFullCompaction {
             l0_sstables: l0_sstables.clone(),
             l1_sstables: l1_sstables.clone(),
-        })?;
+        };
+        let sstables = self.compact(&task)?;
 
         {
             let state_lock = self.state_lock.lock();
@@ -321,6 +323,13 @@ impl LsmStorageInner {
             });
             new_state.levels[0] = (0, sstables.iter().map(|sstable| sstable.sst_id()).collect());
             let _ = std::mem::replace(&mut *state, Arc::new(new_state));
+
+            if let Some(manifest) = &self.manifest {
+                manifest.add_record(
+                    &state_lock,
+                    ManifestRecord::Compaction(task, state.levels[0].1.clone()),
+                )?;
+            }
         }
 
         for id in l0_sstables {
@@ -356,6 +365,9 @@ impl LsmStorageInner {
                 new_state.sstables.retain(|k, _| !deleted.contains(k));
                 println!("compaction finished: {deleted:?} removed, {sst_ids:?} added",);
                 let _ = std::mem::replace(&mut *state, Arc::new(new_state));
+                if let Some(manifest) = &self.manifest {
+                    manifest.add_record(&state_lock, ManifestRecord::Compaction(task, sst_ids))?;
+                }
                 deleted
             };
             for id in deleted {

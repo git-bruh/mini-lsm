@@ -163,7 +163,7 @@ impl LeveledCompactionController {
         snapshot: &LsmStorageState,
         task: &LeveledCompactionTask,
         output: &[usize],
-        _in_recovery: bool,
+        in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
         let mut snapshot = snapshot.clone();
         let mut deleted = Vec::new();
@@ -186,14 +186,16 @@ impl LeveledCompactionController {
             .1
             .extend_from_slice(output);
 
-        snapshot.levels[task.lower_level].1.sort_by(|a, b| {
-            snapshot
-                .sstables
-                .get(a)
-                .expect("sst not found")
-                .first_key()
-                .cmp(snapshot.sstables.get(b).expect("sst not found").first_key())
-        });
+        if !in_recovery {
+            snapshot.levels[task.lower_level].1.sort_by(|a, b| {
+                snapshot
+                    .sstables
+                    .get(a)
+                    .expect("sst not found")
+                    .first_key()
+                    .cmp(snapshot.sstables.get(b).expect("sst not found").first_key())
+            });
+        }
         (snapshot, deleted)
     }
 }

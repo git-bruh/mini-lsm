@@ -16,6 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::fs::File;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,12 +38,30 @@ pub enum ManifestRecord {
 }
 
 impl Manifest {
-    pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            file: Arc::new(Mutex::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)?,
+            )),
+        })
     }
 
-    pub fn recover(_path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
-        unimplemented!()
+    pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
+        let manifest = Self::create(path)?;
+        let mut records_buf = Vec::new();
+        manifest.file.lock().read_to_end(&mut records_buf)?;
+        Ok((
+            manifest,
+            serde_json::Deserializer::from_slice(&records_buf)
+                .into_iter()
+                .map(|record| record.expect("failed to parse record"))
+                .collect(),
+        ))
     }
 
     pub fn add_record(
@@ -53,7 +72,10 @@ impl Manifest {
         self.add_record_when_init(record)
     }
 
-    pub fn add_record_when_init(&self, _record: ManifestRecord) -> Result<()> {
-        unimplemented!()
+    pub fn add_record_when_init(&self, record: ManifestRecord) -> Result<()> {
+        let mut file = self.file.lock();
+        file.write_all(&serde_json::to_vec(&record)?)?;
+        file.sync_all()?;
+        Ok(())
     }
 }
