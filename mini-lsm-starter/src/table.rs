@@ -53,10 +53,12 @@ impl BlockMeta {
         let original_len = buf.len();
         for meta in block_meta {
             buf.put_u32(meta.offset as _);
-            buf.put_u16(meta.first_key.len() as _);
+            buf.put_u16(meta.first_key.key_len() as _);
             buf.put_slice(meta.first_key.as_key_slice().into_inner());
-            buf.put_u16(meta.last_key.len() as _);
+            buf.put_u64(meta.first_key.ts());
+            buf.put_u16(meta.last_key.key_len() as _);
             buf.put_slice(meta.last_key.as_key_slice().into_inner());
+            buf.put_u64(meta.last_key.ts());
         }
         buf.put_u32((buf.len() - original_len) as u32);
         let bloom_begin = buf.len();
@@ -70,10 +72,16 @@ impl BlockMeta {
         let mut meta = Vec::new();
         while buf.has_remaining() {
             let offset = buf.get_u32() as usize;
+
             let first_key_len = buf.get_u16();
-            let first_key = KeyBytes::from_bytes(buf.copy_to_bytes(first_key_len as usize));
+            let key_bytes = buf.copy_to_bytes(first_key_len as usize);
+            let ts = buf.get_u64();
+            let first_key = KeyBytes::from_bytes_with_ts(key_bytes, ts);
+
             let last_key_len = buf.get_u16();
-            let last_key = KeyBytes::from_bytes(buf.copy_to_bytes(last_key_len as usize));
+            let key_bytes = buf.copy_to_bytes(last_key_len as usize);
+            let ts = buf.get_u64();
+            let last_key = KeyBytes::from_bytes_with_ts(key_bytes, ts);
 
             meta.push(BlockMeta {
                 offset,

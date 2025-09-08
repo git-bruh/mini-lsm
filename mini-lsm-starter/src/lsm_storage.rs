@@ -35,7 +35,7 @@ use crate::iterators::{
     StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
     two_merge_iterator::TwoMergeIterator,
 };
-use crate::key::{Key, KeyBytes};
+use crate::key::{Key, KeyBytes, TS_DEFAULT, TS_RANGE_BEGIN};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, map_bound};
@@ -448,7 +448,7 @@ impl LsmStorageInner {
                 .expect("id in l0_sstables but not sstables")
                 .clone();
 
-            if !(sstable.first_key().raw_ref() <= key && sstable.last_key().raw_ref() >= key) {
+            if !(sstable.first_key().key_ref() <= key && sstable.last_key().key_ref() >= key) {
                 continue;
             }
 
@@ -461,7 +461,7 @@ impl LsmStorageInner {
 
             sstable_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
                 sstable,
-                Key::from_slice(key),
+                Key::from_slice(key, TS_RANGE_BEGIN),
             )?));
         }
 
@@ -478,8 +478,8 @@ impl LsmStorageInner {
                         .clone()
                 })
                 .filter(|sstable| {
-                    if !(sstable.first_key().raw_ref() <= key
-                        && sstable.last_key().raw_ref() >= key)
+                    if !(sstable.first_key().key_ref() <= key
+                        && sstable.last_key().key_ref() >= key)
                     {
                         return false;
                     }
@@ -496,7 +496,7 @@ impl LsmStorageInner {
                 .collect();
             concat_iters.push(Box::new(SstConcatIterator::create_and_seek_to_key(
                 sstables,
-                Key::from_slice(key),
+                Key::from_slice(key, TS_RANGE_BEGIN),
             )?));
         }
 
@@ -504,7 +504,9 @@ impl LsmStorageInner {
             MergeIterator::create(sstable_iters),
             MergeIterator::create(concat_iters),
         )?;
-        if merge_iter.key() == Key::from_slice(key) && !merge_iter.value().is_empty() {
+        if merge_iter.key().into_inner() == Key::from_slice(key, TS_DEFAULT).into_inner()
+            && !merge_iter.value().is_empty()
+        {
             return Ok(Some(Bytes::copy_from_slice(merge_iter.value())));
         }
 
@@ -642,13 +644,13 @@ impl LsmStorageInner {
         );
 
         let begin_key = match map_bound(lower) {
-            Bound::Included(x) => Bound::Included(KeyBytes::from_bytes(x)),
-            Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes(x)),
+            Bound::Included(x) => Bound::Included(KeyBytes::from_bytes_with_ts(x, TS_DEFAULT)),
+            Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes_with_ts(x, TS_DEFAULT)),
             Bound::Unbounded => Bound::Unbounded,
         };
         let end_key = match map_bound(upper) {
-            Bound::Included(x) => Bound::Included(KeyBytes::from_bytes(x)),
-            Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes(x)),
+            Bound::Included(x) => Bound::Included(KeyBytes::from_bytes_with_ts(x, TS_DEFAULT)),
+            Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes_with_ts(x, TS_DEFAULT)),
             Bound::Unbounded => Bound::Unbounded,
         };
 

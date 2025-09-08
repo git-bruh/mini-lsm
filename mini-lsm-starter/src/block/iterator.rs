@@ -76,7 +76,7 @@ impl BlockIterator {
     /// Returns true if the iterator is valid.
     /// Note: You may want to make use of `key`
     pub fn is_valid(&self) -> bool {
-        self.key.len() > 0
+        self.key.key_len() > 0
     }
 
     /// Seeks to the first key in the block.
@@ -112,13 +112,19 @@ impl BlockIterator {
         offset += 2;
         let mut prefixed_key = self.first_key.as_key_slice().into_inner()[0..prefix_size].to_vec();
         prefixed_key.extend(self.block.data[offset..offset + key_size].to_vec());
-        let key = KeyVec::from_vec(prefixed_key);
         offset += key_size;
+        let ts = u64::from_be_bytes(
+            self.block.data[offset..offset + std::mem::size_of::<u64>()]
+                .try_into()
+                .expect("wrong u64 size calculation"),
+        );
+        offset += std::mem::size_of::<u64>();
+        let key = KeyVec::from_vec_with_ts(prefixed_key, ts);
         let value_size =
             u16::from_be_bytes([self.block.data[offset], self.block.data[offset + 1]]) as usize;
         offset += 2;
 
-        if self.first_key.len() == 0 {
+        if self.first_key.key_len() == 0 {
             self.first_key = key.clone();
         }
         self.key = key;

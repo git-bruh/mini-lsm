@@ -24,7 +24,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_DEFAULT};
 
 pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
@@ -58,6 +58,8 @@ impl Wal {
             file.read_exact(&mut key_len)?;
             let mut key = vec![0; u16::from_be_bytes([key_len[0], key_len[1]]) as usize];
             file.read_exact(&mut key)?;
+            let mut key_ts = vec![0; std::mem::size_of::<u64>()];
+            file.read_exact(&mut key_ts)?;
             let mut value_len = vec![0; 2];
             file.read_exact(&mut value_len)?;
             let mut value = vec![0; u16::from_be_bytes([value_len[0], value_len[1]]) as usize];
@@ -74,15 +76,16 @@ impl Wal {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_batch(&[(KeySlice::from_slice(key), value)])
+        self.put_batch(&[(KeySlice::from_slice(key, TS_DEFAULT), value)])
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
     pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
         let mut entry = Vec::<u8>::new();
         for (key, value) in data {
-            entry.put_u16(key.len() as _);
+            entry.put_u16(key.key_len() as _);
             entry.put(key.into_inner());
+            entry.put_u64(key.ts());
             entry.put_u16(value.len() as _);
             entry.put(*value);
         }

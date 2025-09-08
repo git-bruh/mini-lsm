@@ -48,8 +48,8 @@ impl BlockBuilder {
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
         // + 10 for offset, key, prefix and value lengths, and final number of elements
-        if self.first_key.len() > 0
-            && ((self.data.len() + (self.offsets.len() * 2) + key.len() + value.len() + 10)
+        if self.first_key.key_len() > 0
+            && ((self.data.len() + (self.offsets.len() * 2) + key.raw_len() + value.len() + 10)
                 > self.block_size)
         {
             return false;
@@ -72,12 +72,13 @@ impl BlockBuilder {
 
         self.offsets.push(self.data.len() as u16);
         self.data.put_u16(prefix_len as _);
-        self.data.put_u16((key.len() - prefix_len) as _);
+        self.data.put_u16((key.key_len() - prefix_len) as _);
         self.data.put(&key.into_inner()[prefix_len..]);
+        self.data.put_u64(key.ts());
         self.data.put_u16(value.len() as _);
         self.data.put(value);
 
-        if self.first_key.len() == 0 {
+        if self.first_key.key_len() == 0 {
             self.first_key.set_from_slice(key);
         }
 
@@ -86,7 +87,7 @@ impl BlockBuilder {
 
     /// Check if there is no key-value pair in the block.
     pub fn is_empty(&self) -> bool {
-        self.first_key.len() == 0
+        self.first_key.key_len() == 0
     }
 
     /// Finalize the block.
