@@ -76,7 +76,7 @@ impl SstConcatIterator {
 
     pub fn create_and_seek_after_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
         let mut concat_iter = Self::create_and_seek_to_key(sstables, key)?;
-        if concat_iter.is_valid() && concat_iter.key() == key {
+        while concat_iter.is_valid() && concat_iter.key().key_ref() == key.key_ref() {
             concat_iter.next()?;
         }
         Ok(concat_iter)

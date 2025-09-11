@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::BTreeSet, iter::FromIterator};
 
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_ENABLED};
 use crate::manifest::ManifestRecord;
 use anyhow::Result;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
@@ -137,10 +137,14 @@ impl LsmStorageInner {
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut builder = SsTableBuilder::new(self.options.block_size);
         let mut ssts = Vec::new();
+        let mut prev_key = Vec::<u8>::new();
         while iter.is_valid() {
-            if !compact_to_bottom_level || iter.value().len() > 0 {
+            if TS_ENABLED || !compact_to_bottom_level || iter.value().len() > 0 {
                 builder.add(iter.key(), iter.value());
-                if builder.estimated_size() > self.options.target_sst_size {
+                // ensure same key with different timestamps get put in the same SST
+                if &prev_key != iter.key().into_inner()
+                    && builder.estimated_size() > self.options.target_sst_size
+                {
                     let id = self.next_sst_id();
                     let builder = std::mem::replace(
                         &mut builder,
@@ -148,6 +152,7 @@ impl LsmStorageInner {
                     );
                     ssts.push(Arc::new(builder.build(id, None, self.path_of_sst(id))?))
                 }
+                prev_key = iter.key().into_inner().to_vec();
             }
             iter.next()?;
         }

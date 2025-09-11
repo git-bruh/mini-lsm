@@ -35,7 +35,7 @@ use crate::iterators::{
     StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
     two_merge_iterator::TwoMergeIterator,
 };
-use crate::key::{Key, KeyBytes, TS_DEFAULT, TS_RANGE_BEGIN};
+use crate::key::{Key, KeyBytes, KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, map_bound};
@@ -302,7 +302,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(0)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -430,13 +430,22 @@ impl LsmStorageInner {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let state = Arc::clone(&self.state.read());
 
-        if let Ok(val) = state.memtable.get(key) {
-            return Ok(val);
-        }
+        let (lower, upper) = (
+            Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
+            Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
+        );
 
-        for memtable in &state.imm_memtables {
-            if let Ok(val) = memtable.get(key) {
-                return Ok(val);
+        for memtable in [state.memtable.clone()]
+            .iter()
+            .chain(state.imm_memtables.iter())
+        {
+            let iter = memtable.scan(lower, upper);
+            if iter.is_valid() {
+                return Ok(if !iter.value().is_empty() {
+                    Some(Bytes::copy_from_slice(iter.value()))
+                } else {
+                    None
+                });
             }
         }
 
@@ -514,27 +523,46 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        let mvcc = self.mvcc.as_ref().expect("mvcc not initialized");
+        let _lock = mvcc.write_lock.lock();
+
+        let ts = mvcc.latest_commit_ts() + 1;
+
+        for operation in batch {
+            let state = self.state.read();
+
+            match operation {
+                WriteBatchRecord::Put(k, v) => state
+                    .memtable
+                    .put(KeySlice::from_slice(k.as_ref(), ts), v.as_ref())?,
+                WriteBatchRecord::Del(k) => state
+                    .memtable
+                    .put(KeySlice::from_slice(k.as_ref(), ts), &[])?,
+            }
+
+            if state.memtable.approximate_size() > self.options.target_sst_size {
+                drop(state);
+                let state_lock = self.state_lock.lock();
+                if self.state.read().memtable.approximate_size() > self.options.target_sst_size {
+                    self.force_freeze_memtable(&state_lock)?;
+                }
+            }
+        }
+
+        mvcc.update_commit_ts(ts);
+
+        Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let state = self.state.read();
-        state.memtable.put(key, value)?;
-        if state.memtable.approximate_size() > self.options.target_sst_size {
-            drop(state);
-            let state_lock = self.state_lock.lock();
-            if self.state.read().memtable.approximate_size() > self.options.target_sst_size {
-                self.force_freeze_memtable(&state_lock)?;
-            }
-        }
-        Ok(())
+        self.write_batch(&[WriteBatchRecord::Put(key, value)])
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.put(key, &[])
+        self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -635,6 +663,18 @@ impl LsmStorageInner {
     ) -> Result<FusedIterator<LsmIterator>> {
         let state = Arc::clone(&self.state.read());
 
+        let lower = match lower {
+            Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, TS_RANGE_BEGIN)),
+            Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, TS_RANGE_END)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        let upper = match upper {
+            Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, TS_RANGE_END)),
+            Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, TS_RANGE_BEGIN)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
         let mut iters = vec![Box::new(state.memtable.scan(lower, upper))];
         iters.extend(
             state
@@ -643,16 +683,8 @@ impl LsmStorageInner {
                 .map(|memtable| Box::new(memtable.scan(lower, upper))),
         );
 
-        let begin_key = match map_bound(lower) {
-            Bound::Included(x) => Bound::Included(KeyBytes::from_bytes_with_ts(x, TS_DEFAULT)),
-            Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes_with_ts(x, TS_DEFAULT)),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        let end_key = match map_bound(upper) {
-            Bound::Included(x) => Bound::Included(KeyBytes::from_bytes_with_ts(x, TS_DEFAULT)),
-            Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes_with_ts(x, TS_DEFAULT)),
-            Bound::Unbounded => Bound::Unbounded,
-        };
+        let begin_key = map_bound(lower);
+        let end_key = map_bound(upper);
 
         let mut sstable_iters: Vec<Box<SsTableIterator>> = Vec::new();
         for id in &state.l0_sstables {

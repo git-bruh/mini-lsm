@@ -24,7 +24,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::key::{KeySlice, TS_DEFAULT};
+use crate::key::{KeyBytes, KeySlice};
 
 pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
@@ -44,7 +44,7 @@ impl Wal {
         })
     }
 
-    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -67,7 +67,13 @@ impl Wal {
 
             remaining_len -= key_len.len() + key.len() + value_len.len() + value.len();
 
-            skiplist.insert(key.into(), value.into());
+            skiplist.insert(
+                KeyBytes::from_bytes_with_ts(
+                    key.into(),
+                    u64::from_be_bytes(key_ts.try_into().expect("invalid size of u64")),
+                ),
+                value.into(),
+            );
         }
 
         Ok(Self {
@@ -75,8 +81,8 @@ impl Wal {
         })
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_batch(&[(KeySlice::from_slice(key, TS_DEFAULT), value)])
+    pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.

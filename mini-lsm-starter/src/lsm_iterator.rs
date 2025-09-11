@@ -16,7 +16,6 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use anyhow::Result;
-use bytes::Bytes;
 use std::ops::Bound;
 
 use crate::{
@@ -24,6 +23,7 @@ use crate::{
         StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
         two_merge_iterator::TwoMergeIterator,
     },
+    key::KeyBytes,
     mem_table::MemTableIterator,
     table::SsTableIterator,
 };
@@ -37,30 +37,44 @@ type LsmIteratorInner = TwoMergeIterator<
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     is_valid: bool,
-    end_bound: Bound<Bytes>,
+    end_bound: Bound<KeyBytes>,
+    prev_key: Vec<u8>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<KeyBytes>) -> Result<Self> {
         let mut iter = Self {
             inner: iter,
             is_valid: true,
             end_bound,
+            prev_key: Vec::new(),
         };
         iter.move_to_non_delete()?;
         Ok(iter)
     }
 
     fn move_to_non_delete(&mut self) -> Result<()> {
-        while self.is_valid() && self.inner.value().is_empty() {
+        while self.is_valid() {
+            // don't read the same key twice and ensure we don't skip to
+            // a non-deleted version of a deleted key
+            if self.inner.value().is_empty() {
+                self.prev_key = self.key().to_vec();
+            } else if &self.prev_key != self.key() {
+                break;
+            }
+
             self.inner.next()?;
         }
 
         match &self.end_bound {
-            Bound::Included(x) => self.is_valid = self.inner.key().into_inner() <= x,
-            Bound::Excluded(x) => self.is_valid = self.inner.key().into_inner() < x,
+            Bound::Included(x) => self.is_valid = self.inner.key() <= x.as_key_slice(),
+            Bound::Excluded(x) => self.is_valid = self.inner.key() < x.as_key_slice(),
             Bound::Unbounded => {}
         };
+
+        if self.is_valid() {
+            self.prev_key = self.key().to_vec();
+        }
 
         Ok(())
     }
@@ -82,6 +96,10 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
+        if !self.is_valid() {
+            return Ok(());
+        }
+
         self.inner.next()?;
         self.move_to_non_delete()
     }
