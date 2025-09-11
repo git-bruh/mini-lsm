@@ -39,7 +39,10 @@ use crate::key::{Key, KeyBytes, KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_E
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, map_bound};
-use crate::mvcc::LsmMvccInner;
+use crate::mvcc::{
+    LsmMvccInner,
+    txn::{Transaction, TxnIterator},
+};
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -209,7 +212,7 @@ impl MiniLsm {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<Transaction>> {
         self.inner.new_txn()
     }
 
@@ -242,7 +245,7 @@ impl MiniLsm {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        self.inner.scan(lower, upper)
+        self.inner.scan_with_ts(lower, upper, TS_RANGE_BEGIN)
     }
 
     /// Only call this in test cases due to race conditions
@@ -390,6 +393,22 @@ impl LsmStorageInner {
                 )?);
             }
 
+            let mut max_ts = 0;
+            for sstable in state.sstables.values() {
+                max_ts = max_ts.max(sstable.max_ts());
+            }
+            for memtable in [state.memtable.clone()]
+                .iter()
+                .chain(state.imm_memtables.iter())
+            {
+                let mut iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
+                while iter.is_valid() {
+                    max_ts = max_ts.max(iter.key().ts());
+                    iter.next()?;
+                }
+            }
+            storage.mvcc().update_commit_ts(max_ts);
+
             // sort bottom level SSTs
             if let CompactionController::Leveled(ctrl) = &storage.compaction_controller {
                 let (new_state, _) = ctrl.apply_compaction_result(
@@ -427,11 +446,11 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get_with_ts(&self, key: &[u8], ts: u64) -> Result<Option<Bytes>> {
         let state = Arc::clone(&self.state.read());
 
         let (lower, upper) = (
-            Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
+            Bound::Included(KeySlice::from_slice(key, ts)),
             Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
         );
 
@@ -522,9 +541,13 @@ impl LsmStorageInner {
         Ok(None)
     }
 
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.get_with_ts(key, TS_RANGE_BEGIN)
+    }
+
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        let mvcc = self.mvcc.as_ref().expect("mvcc not initialized");
+        let mvcc = self.mvcc();
         let _lock = mvcc.write_lock.lock();
 
         let ts = mvcc.latest_commit_ts() + 1;
@@ -650,28 +673,33 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
+    pub fn new_txn(self: &Arc<Self>) -> Result<Arc<Transaction>> {
+        Ok(self.mvcc().new_txn(self.clone(), false))
     }
 
     /// Create an iterator over a range of keys.
-    pub fn scan(
+    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        let txn = self.mvcc().new_txn(self.clone(), false);
+        txn.scan(lower, upper)
+    }
+
+    pub fn scan_with_ts(
         &self,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
+        ts: u64,
     ) -> Result<FusedIterator<LsmIterator>> {
         let state = Arc::clone(&self.state.read());
 
         let lower = match lower {
-            Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, TS_RANGE_BEGIN)),
+            Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, ts)),
             Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, TS_RANGE_END)),
             Bound::Unbounded => Bound::Unbounded,
         };
 
         let upper = match upper {
             Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, TS_RANGE_END)),
-            Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, TS_RANGE_BEGIN)),
+            Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, ts)),
             Bound::Unbounded => Bound::Unbounded,
         };
 
@@ -757,6 +785,7 @@ impl LsmStorageInner {
                 MergeIterator::create(concat_iters),
             )?,
             map_bound(upper),
+            ts,
         )?))
     }
 }

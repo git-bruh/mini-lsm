@@ -39,15 +39,21 @@ pub struct LsmIterator {
     is_valid: bool,
     end_bound: Bound<KeyBytes>,
     prev_key: Vec<u8>,
+    read_ts: u64,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<KeyBytes>) -> Result<Self> {
+    pub(crate) fn new(
+        iter: LsmIteratorInner,
+        end_bound: Bound<KeyBytes>,
+        read_ts: u64,
+    ) -> Result<Self> {
         let mut iter = Self {
             inner: iter,
             is_valid: true,
             end_bound,
             prev_key: Vec::new(),
+            read_ts,
         };
         iter.move_to_non_delete()?;
         Ok(iter)
@@ -59,7 +65,7 @@ impl LsmIterator {
             // a non-deleted version of a deleted key
             if self.inner.value().is_empty() {
                 self.prev_key = self.key().to_vec();
-            } else if &self.prev_key != self.key() {
+            } else if &self.prev_key != self.key() || self.inner.key().ts() <= self.read_ts {
                 break;
             }
 
