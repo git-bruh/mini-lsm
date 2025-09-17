@@ -35,7 +35,7 @@ use crate::iterators::{
     StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
     two_merge_iterator::TwoMergeIterator,
 };
-use crate::key::{Key, KeyBytes, KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END};
+use crate::key::{Key, KeyBytes, KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, map_bound};
@@ -240,12 +240,8 @@ impl MiniLsm {
         self.inner.sync()
     }
 
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
-        self.inner.scan_with_ts(lower, upper, TS_RANGE_BEGIN)
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        self.inner.scan(lower, upper)
     }
 
     /// Only call this in test cases due to race conditions
@@ -446,27 +442,19 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get_with_ts(&self, key: &[u8], ts: u64) -> Result<Option<Bytes>> {
+    pub fn get_with_ts(&self, key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
         let state = Arc::clone(&self.state.read());
 
-        let (lower, upper) = (
-            Bound::Included(KeySlice::from_slice(key, ts)),
-            Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
-        );
-
-        for memtable in [state.memtable.clone()]
+        let memtable_iters = [state.memtable.clone()]
             .iter()
             .chain(state.imm_memtables.iter())
-        {
-            let iter = memtable.scan(lower, upper);
-            if iter.is_valid() {
-                return Ok(if !iter.value().is_empty() {
-                    Some(Bytes::copy_from_slice(iter.value()))
-                } else {
-                    None
-                });
-            }
-        }
+            .map(|memtable| {
+                Box::new(memtable.scan(
+                    Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN)),
+                    Bound::Included(KeySlice::from_slice(key, TS_RANGE_END)),
+                ))
+            })
+            .collect::<Vec<_>>();
 
         let mut sstable_iters: Vec<Box<SsTableIterator>> = Vec::new();
         for id in &state.l0_sstables {
@@ -528,21 +516,29 @@ impl LsmStorageInner {
             )?));
         }
 
-        let merge_iter = TwoMergeIterator::create(
-            MergeIterator::create(sstable_iters),
-            MergeIterator::create(concat_iters),
+        let merge_iter = LsmIterator::new(
+            TwoMergeIterator::create(
+                TwoMergeIterator::create(
+                    MergeIterator::create(memtable_iters),
+                    MergeIterator::create(sstable_iters),
+                )?,
+                MergeIterator::create(concat_iters),
+            )?,
+            Bound::Unbounded,
+            read_ts,
         )?;
-        if merge_iter.key().into_inner() == Key::from_slice(key, TS_DEFAULT).into_inner()
-            && !merge_iter.value().is_empty()
-        {
+
+        if merge_iter.is_valid() && merge_iter.key() == key && !merge_iter.value().is_empty() {
             return Ok(Some(Bytes::copy_from_slice(merge_iter.value())));
         }
 
         Ok(None)
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        self.get_with_ts(key, TS_RANGE_BEGIN)
+    pub fn get(self: &Arc<Self>, key: &[u8]) -> Result<Option<Bytes>> {
+        self.mvcc()
+            .new_txn(self.clone(), self.options.serializable)
+            .get(key)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -699,7 +695,7 @@ impl LsmStorageInner {
 
         let upper = match upper {
             Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, TS_RANGE_END)),
-            Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, ts)),
+            Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, TS_RANGE_BEGIN)),
             Bound::Unbounded => Bound::Unbounded,
         };
 
@@ -732,12 +728,18 @@ impl LsmStorageInner {
             }
 
             match &begin_key {
-                Bound::Included(key) => sstable_iters.push(Box::new(
-                    SsTableIterator::create_and_seek_to_key(sstable, key.as_key_slice())?,
-                )),
-                Bound::Excluded(key) => sstable_iters.push(Box::new(
-                    SsTableIterator::create_and_seek_after_key(sstable, key.as_key_slice())?,
-                )),
+                Bound::Included(key) => {
+                    sstable_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                        sstable,
+                        KeySlice::from_slice(key.key_ref(), TS_RANGE_BEGIN),
+                    )?))
+                }
+                Bound::Excluded(key) => {
+                    sstable_iters.push(Box::new(SsTableIterator::create_and_seek_after_key(
+                        sstable,
+                        KeySlice::from_slice(key.key_ref(), TS_RANGE_BEGIN),
+                    )?))
+                }
                 Bound::Unbounded => sstable_iters.push(Box::new(
                     SsTableIterator::create_and_seek_to_first(sstable)?,
                 )),
@@ -797,12 +799,12 @@ fn range_overlap(
     last_key: &KeyBytes,
 ) -> bool {
     return match user_begin {
-        Bound::Included(key) => first_key >= key,
-        Bound::Excluded(key) => first_key > key,
+        Bound::Included(key) => first_key.key_ref() >= key.key_ref(),
+        Bound::Excluded(key) => first_key.key_ref() > key.key_ref(),
         Bound::Unbounded => false,
     } || match user_end {
-        Bound::Included(key) => last_key <= key,
-        Bound::Excluded(key) => last_key < key,
+        Bound::Included(key) => last_key.key_ref() <= key.key_ref(),
+        Bound::Excluded(key) => last_key.key_ref() < key.key_ref(),
         Bound::Unbounded => true,
     };
 }

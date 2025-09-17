@@ -63,9 +63,9 @@ impl LsmIterator {
         while self.is_valid() {
             // don't read the same key twice and ensure we don't skip to
             // a non-deleted version of a deleted key
-            if self.inner.value().is_empty() {
+            if self.inner.value().is_empty() && self.inner.key().ts() <= self.read_ts {
                 self.prev_key = self.key().to_vec();
-            } else if &self.prev_key != self.key() || self.inner.key().ts() <= self.read_ts {
+            } else if &self.prev_key != self.key() && self.inner.key().ts() <= self.read_ts {
                 break;
             }
 

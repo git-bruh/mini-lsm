@@ -65,7 +65,8 @@ impl Wal {
             let mut value = vec![0; u16::from_be_bytes([value_len[0], value_len[1]]) as usize];
             file.read_exact(&mut value)?;
 
-            remaining_len -= key_len.len() + key.len() + value_len.len() + value.len();
+            remaining_len -=
+                key_len.len() + key.len() + key_ts.len() + value_len.len() + value.len();
 
             skiplist.insert(
                 KeyBytes::from_bytes_with_ts(
