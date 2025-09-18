@@ -47,6 +47,10 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("txn already committed");
+        }
+
         if let Some(entry) = self.local_storage.get(key) {
             return if entry.value().is_empty() {
                 Ok(None)
@@ -58,7 +62,11 @@ impl Transaction {
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
-        let local_iter = TxnLocalIterator::new(
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("txn already committed");
+        }
+
+        let mut local_iter = TxnLocalIterator::new(
             self.local_storage.clone(),
             |skip_map| {
                 skip_map.range((
@@ -68,6 +76,7 @@ impl Transaction {
             },
             (Bytes::new(), Bytes::new()),
         );
+        local_iter.next()?;
 
         TxnIterator::create(
             self.clone(),
@@ -201,7 +210,16 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        self.iter.next()
+        while self.is_valid() {
+            self.iter.next()?;
+            if self.value().is_empty() {
+                continue;
+            } else {
+                break;
+            }
+        }
+
+        return Ok(());
     }
 
     fn num_active_iterators(&self) -> usize {
