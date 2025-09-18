@@ -34,15 +34,31 @@ impl Watermark {
         }
     }
 
-    pub fn add_reader(&mut self, ts: u64) {}
+    pub fn add_reader(&mut self, ts: u64) {
+        if let Some(count) = self.readers.get_mut(&ts) {
+            *count += 1;
+        } else {
+            self.readers.insert(ts, 1);
+        }
+    }
 
-    pub fn remove_reader(&mut self, ts: u64) {}
+    pub fn remove_reader(&mut self, ts: u64) {
+        if let Some(count) = self.readers.get_mut(&ts) {
+            if *count == 1 {
+                self.readers.remove(&ts);
+            } else {
+                *count -= 1;
+            }
+        } else {
+            panic!("no reader exists for ts {ts}");
+        }
+    }
 
     pub fn num_retained_snapshots(&self) -> usize {
         self.readers.len()
     }
 
     pub fn watermark(&self) -> Option<u64> {
-        Some(0)
+        self.readers.keys().min().copied()
     }
 }

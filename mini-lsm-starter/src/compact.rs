@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::BTreeSet, iter::FromIterator};
 
-use crate::key::{KeySlice, TS_ENABLED};
+use crate::key::KeySlice;
 use crate::manifest::ManifestRecord;
 use anyhow::Result;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
@@ -135,25 +135,39 @@ impl LsmStorageInner {
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
         compact_to_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
+        let watermark = self.mvcc().watermark();
+
         let mut builder = SsTableBuilder::new(self.options.block_size);
         let mut ssts = Vec::new();
         let mut prev_key = Vec::<u8>::new();
+        let mut latest = Vec::<u8>::new();
         while iter.is_valid() {
-            if TS_ENABLED || !compact_to_bottom_level || iter.value().len() > 0 {
-                builder.add(iter.key(), iter.value());
-                // ensure same key with different timestamps get put in the same SST
-                if &prev_key != iter.key().into_inner()
-                    && builder.estimated_size() > self.options.target_sst_size
-                {
-                    let id = self.next_sst_id();
-                    let builder = std::mem::replace(
-                        &mut builder,
-                        SsTableBuilder::new(self.options.block_size),
-                    );
-                    ssts.push(Arc::new(builder.build(id, None, self.path_of_sst(id))?))
+            if iter.key().ts() <= watermark {
+                if iter.key().key_ref() == &latest {
+                    iter.next()?;
+                    continue;
                 }
-                prev_key = iter.key().into_inner().to_vec();
+
+                latest = iter.key().into_inner().to_vec();
+
+                if compact_to_bottom_level && iter.value().is_empty() {
+                    iter.next()?;
+                    continue;
+                }
             }
+
+            builder.add(iter.key(), iter.value());
+
+            // ensure same key with different timestamps get put in the same SST
+            if &prev_key != iter.key().into_inner()
+                && builder.estimated_size() > self.options.target_sst_size
+            {
+                let id = self.next_sst_id();
+                let builder =
+                    std::mem::replace(&mut builder, SsTableBuilder::new(self.options.block_size));
+                ssts.push(Arc::new(builder.build(id, None, self.path_of_sst(id))?))
+            }
+            prev_key = iter.key().into_inner().to_vec();
             iter.next()?;
         }
         // TODO this leads to an extra SST under some cases
